@@ -1,0 +1,3 @@
+node_modules/
+totp_secret.txt
+totp_configured.txt
