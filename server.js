@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 'use strict';
 
-const http = require('http');
-const fs   = require('fs');
-const path = require('path');
-const os = require('os');
+const http  = require('http');
+const https = require('https');
+const fs    = require('fs');
+const path  = require('path');
+const os    = require('os');
 const { spawn, exec } = require('child_process');
 const { WebSocketServer } = require('ws');
 
@@ -14,7 +15,9 @@ const AGENTS_DIR   = process.env.AGENTS_DIR || path.join(__dirname, '../[your-pr
 const JOBS_FILE    = path.join(WORKSPACE, 'crons/jobs.json');
 const LOG_DIR      = path.join(WORKSPACE, 'crons/logs');
 const AGENT_LOG    = path.join(AGENTS_DIR, 'agent-log.md');
-const PROPOSALS_PATH = path.join(AGENTS_DIR, 'proposals.md');
+const PROPOSALS_PATH    = path.join(AGENTS_DIR, 'proposals.md');
+const CLAUDE_CREDS_PATH = process.env.CLAUDE_CREDS_PATH ||
+  path.join(os.homedir(), '.claude', '.credentials.json');
 
 // ---------------------------------------------------------------------------
 // TOTP Auth
@@ -109,7 +112,7 @@ const PORT = 4242;
 
 const COLUMN_ORDER = [
   'Ready', 'In Progress', 'In Review', 'Changes Requested',
-  'Pending Human', 'Approved', "Owner's Queue", 'Shipped',
+  'Pending Human', 'Approved', "Keith's Queue", 'Shipped',
 ];
 
 function parseBacklog(content) {
@@ -146,18 +149,86 @@ function readBoard() {
 // ---------------------------------------------------------------------------
 
 const AGENT_DEFS = [
-  { id: '[your-project]-agent-developer',        name: 'Developer',       logRole: 'DEVELOPER',       color: '#22d3ee', schedule: [0,10,20,30,40,50],              lockFile: 'DEV_LOCK',             lockMaxMs: 25*60*1000, pauseFile: 'DEV_PAUSE' },
-  { id: '[your-project]-agent-reviewer',         name: 'Reviewer',        logRole: 'REVIEWER',        color: '#c084fc', schedule: [5,15,25,35,45,55],              lockFile: 'REVIEWER_LOCK',        lockMaxMs: 20*60*1000, pauseFile: 'REV_PAUSE' },
+  { id: '[your-project]-agent-developer',        name: 'Developer',       logRole: 'DEVELOPER',       color: '#22d3ee', schedule: [1,26,51],                       lockFile: 'DEV_LOCK',             lockMaxMs: 25*60*1000, pauseFile: 'DEV_PAUSE' },
+  { id: '[your-project]-agent-codex-developer',  name: 'Codex Dev',       logRole: 'CODEX-DEVELOPER', color: '#34d399', schedule: [8,38],                           lockFile: 'CODEX_DEV_LOCK',       lockMaxMs: 25*60*1000 },
+  { id: '[your-project]-agent-reviewer',         name: 'Reviewer',        logRole: 'REVIEWER',        color: '#c084fc', schedule: [4,29,54],                       lockFile: 'REVIEWER_LOCK',        lockMaxMs: 20*60*1000, pauseFile: 'REV_PAUSE' },
   { id: '[your-project]-agent-trd-watcher',      name: 'TRD Watcher',     logRole: 'TRD-WATCHER',     color: '#f0abfc', schedule: [2,7,12,17,22,27,32,37,42,47,52,57], lockFile: 'TRD_WATCHER_LOCK',  lockMaxMs:  7*60*1000, pauseFile: 'TRD_PAUSE' },
   { id: '[your-project]-agent-merge-watcher',    name: 'Merge Watcher',   logRole: 'MERGE-WATCHER',   color: '#60a5fa', schedule: [0,5,10,15,20,25,30,35,40,45,50,55], lockFile: 'MERGE_WATCHER_LOCK', lockMaxMs:  8*60*1000, pauseFile: 'MW_PAUSE' },
-  { id: '[your-project]-agent-project-manager',  name: 'Project Mgr',     logRole: 'PROJECT-MANAGER', color: '#fbbf24', schedule: [2,32],                           lockFile: 'PM_LOCK',              lockMaxMs: 12*60*1000 },
+  { id: '[your-project]-agent-project-manager',  name: 'Project Mgr',     logRole: 'PROJECT-MANAGER', color: '#fbbf24', schedule: [7,57],                          lockFile: 'PM_LOCK',              lockMaxMs: 12*60*1000 },
   { id: '[your-project]-agent-product-manager',  name: 'Product Mgr',     logRole: 'PRODUCT-MANAGER', color: '#4ade80', everyNHours: 4,                            lockFile: 'PRODUCT_MANAGER_LOCK', lockMaxMs: 12*60*1000 },
-  { id: '[your-project]-agent-domain-researcher', name: 'Vet Researcher', logRole: 'VET-RESEARCHER', color: '#38bdf8', daily: { hour: 7 },                  lockFile: 'VET_RESEARCHER_LOCK',  lockMaxMs: 15*60*1000 },
+  { id: '[your-project]-agent-vet-industry-researcher', name: 'Vet Researcher', logRole: 'VET-RESEARCHER', color: '#38bdf8', daily: { hour: 7 },                  lockFile: 'VET_RESEARCHER_LOCK',  lockMaxMs: 15*60*1000 },
   { id: '[your-project]-agent-system-reviewer',  name: 'System Reviewer', logRole: 'SYSTEM-REVIEWER', color: '#fde68a', daily: { hour: 21 },                      lockFile: 'SYSTEM_REVIEWER_LOCK', lockMaxMs: 15*60*1000 },
   { id: '[your-project]-agent-codebase-auditor', name: 'Code Auditor',    logRole: 'CODEBASE-AUDITOR', color: '#fb923c', everyNHours: 3,                            lockFile: 'AUDITOR_LOCK',         lockMaxMs: 25*60*1000, pauseFile: 'AUDITOR_PAUSE' },
   { id: '[your-project]-main-ci-fixer',          name: 'Main CI Fixer',   logRole: null,               color: '#f87171', everyNMinutes: 2 },
   { id: '[your-project]-pr-ci-fixer',            name: 'PR CI Fixer',     logRole: null,               color: '#fdba74', everyNMinutes: 2,                            lockFile: '/tmp/[your-project]-pr-ci-fixer.lock', lockMaxMs: 20*60*1000 },
 ];
+
+const FAST_MODE_FILE     = path.join(AGENTS_DIR, 'FAST_MODE');
+const THROTTLE_ZONE_FILE = path.join(__dirname, '../data/throttle-zone.json');
+
+const SPEED_SCHEDULES = {
+  fast: {
+    '[your-project]-agent-developer':       { schedule: [1,6,11,16,21,26,31,36,41,46,51,56], cron: '1,6,11,16,21,26,31,36,41,46,51,56 * * * *' },
+    '[your-project]-agent-reviewer':        { schedule: [4,9,14,19,24,29,34,39,44,49,54,59], cron: '4,9,14,19,24,29,34,39,44,49,54,59 * * * *' },
+    '[your-project]-agent-project-manager': { schedule: [3,33], cron: '3,33 * * * *' },
+    '[your-project]-agent-codex-developer': { schedule: [8,33,58], cron: '8,33,58 * * * *' },
+  },
+  slow: {
+    '[your-project]-agent-developer':       { schedule: [1,26,51], cron: '1,26,51 * * * *' },
+    '[your-project]-agent-reviewer':        { schedule: [4,29,54], cron: '4,29,54 * * * *' },
+    '[your-project]-agent-project-manager': { schedule: [7,57], cron: '7,57 * * * *' },
+    '[your-project]-agent-codex-developer': { schedule: [8,38], cron: '8,38 * * * *' },
+  },
+  conservation: {
+    '[your-project]-agent-developer':       { schedule: [1,46], cron: '1,46 * * * *' },
+    '[your-project]-agent-reviewer':        { schedule: [4], cron: '4 * * * *' },
+    '[your-project]-agent-project-manager': { schedule: [7], cron: '7 */2 * * *' },
+    '[your-project]-agent-codex-developer': { schedule: [8], cron: '8 */2 * * *' },
+  },
+  minimal: {
+    '[your-project]-agent-developer':       { schedule: [1], cron: '1 */3 * * *' },
+    '[your-project]-agent-reviewer':        { schedule: [4], cron: '4 */3 * * *' },
+    '[your-project]-agent-project-manager': { schedule: [7], cron: '7 */6 * * *' },
+    '[your-project]-agent-codex-developer': { schedule: [8], cron: '8 */3 * * *' },
+  },
+};
+
+function getThrottleZone() {
+  try { return JSON.parse(fs.readFileSync(THROTTLE_ZONE_FILE, 'utf8')); } catch { return null; }
+}
+
+function getSpeedMode() {
+  return fileExists(FAST_MODE_FILE) ? 'fast' : 'slow';
+}
+
+function applySpeedMode(mode) {
+  const sched = SPEED_SCHEDULES[mode];
+  if (!sched) return;
+  for (const [id, info] of Object.entries(sched)) {
+    const def = AGENT_DEFS.find(d => d.id === id);
+    if (!def) continue;
+    delete def.everyNMinutes;
+    delete def.everyNHours;
+    def.schedule = info.schedule;
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(JOBS_FILE, 'utf8'));
+    const jobs = data.jobs || data;
+    for (const [id, info] of Object.entries(sched)) {
+      const job = jobs.find(j => j.id === id);
+      if (job) job.schedule = info.cron;
+    }
+    fs.writeFileSync(JOBS_FILE, JSON.stringify(data, null, 2));
+  } catch (e) { console.error('applySpeedMode write error:', e); }
+  if (mode === 'fast') {
+    fs.writeFileSync(FAST_MODE_FILE, new Date().toISOString());
+  } else {
+    try { fs.unlinkSync(FAST_MODE_FILE); } catch (_) {}
+  }
+}
+
+// Restore speed mode on startup
+if (fileExists(FAST_MODE_FILE)) applySpeedMode('fast');
 
 function fileExists(p) { try { fs.statSync(p); return true; } catch { return false; } }
 function fileMtimeMs(p) { try { return fs.statSync(p).mtimeMs; } catch { return 0; } }
@@ -221,6 +292,18 @@ function getMaxIntervalSecs(def) {
   return maxGap * 60;
 }
 
+function getIntervalInfo(def) {
+  if (def.daily) {
+    const h = def.daily.hour;
+    const label = `daily ${h % 12 || 12}${h < 12 ? 'am' : 'pm'} ET`;
+    return { label, raw: null, editable: false };
+  }
+  if (def.everyNHours)   return { label: `${def.everyNHours}h`,   raw: `${def.everyNHours}h`,   editable: true };
+  if (def.everyNMinutes) return { label: `${def.everyNMinutes}m`, raw: `${def.everyNMinutes}m`, editable: true };
+  const gapMins = getMaxIntervalSecs(def) / 60;
+  return { label: `${gapMins}m`, raw: `${gapMins}m`, editable: true };
+}
+
 // Reads last 16KB of agent-log.md and extracts last "next:" hint for a role
 function lastNextHint(logRole) {
   if (!logRole) return '';
@@ -240,12 +323,13 @@ function lastNextHint(logRole) {
       const m = block.match(/^- next:\s*(.+)$/m);
       if (m) lastNext = m[1].trim();
     }
-    return lastNext.length > 60 ? lastNext.slice(0, 58) + '…' : lastNext;
+    return lastNext.length > 400 ? lastNext.slice(0, 398) + '…' : lastNext;
   } catch { return ''; }
 }
 
 function buildAgentStatus() {
   const globalPaused = isPaused();
+  const jobs = loadJobs();
   return AGENT_DEFS.map(def => {
     const lockPath  = def.lockFile  ? (def.lockFile.startsWith('/') ? def.lockFile : path.join(AGENTS_DIR, def.lockFile))  : null;
     const pausePath = def.pauseFile ? path.join(AGENTS_DIR, def.pauseFile) : null;
@@ -264,8 +348,11 @@ function buildAgentStatus() {
     const secsUntil = getSecsUntilNext(def);
     const maxSecs   = getMaxIntervalSecs(def);
     const hint      = lastNextHint(def.logRole);
+    const { label: intervalLabel, raw: intervalRaw, editable: intervalEditable } = getIntervalInfo(def);
+    const job = jobs.find(j => j.id === def.id);
+    const model = job?.runner ? job.runner : (job?.model || 'sonnet');
 
-    return { id: def.id, name: def.name, color: def.color, status, secsUntil, maxSecs, hint };
+    return { id: def.id, name: def.name, color: def.color, status, secsUntil, maxSecs, hint, intervalLabel, intervalRaw, intervalEditable, model };
   });
 }
 
@@ -273,8 +360,9 @@ function buildAgentStatus() {
 // VPS health + CI queue cache
 // ---------------------------------------------------------------------------
 
-let vpsCache = { mem: null, cpu: null, swap: null, disk: null, uptime: 0, ts: 0 };
-let ciCache  = { runners: [], queue: [], bumpCancelled: [], ts: 0 };
+let vpsCache    = { mem: null, cpu: null, swap: null, disk: null, uptime: 0, ts: 0 };
+let ciCache     = { runners: [], queue: [], bumpCancelled: [], ts: 0 };
+let claudeCache = { plan: null, tier: null, ts: 0, error: null };
 
 function refreshVps() {
   const total  = os.totalmem();
@@ -316,15 +404,27 @@ function refreshVps() {
     });
 }
 
-const GH = process.env.GH_PATH || 'gh';
+const GH = '/usr/local/bin/gh';
 
 function ghApi(endpoint, cb) {
   exec(`${GH} api "${endpoint}"`,
-    { env: { ...process.env, HOME: process.env.HOME || require('os').homedir() } },
+    { env: { ...process.env, HOME: process.env.HOME || '/home/user' } },
     (err, stdout) => {
       if (err || !stdout) return cb(null);
       try { cb(JSON.parse(stdout.trim())); } catch (_) { cb(null); }
     });
+}
+
+function refreshClaudeInfo() {
+  try {
+    const creds = JSON.parse(fs.readFileSync(CLAUDE_CREDS_PATH, 'utf8'));
+    const oauth = creds.claudeAiOauth || {};
+    claudeCache.plan = oauth.subscriptionType || null;
+    claudeCache.tier = oauth.rateLimitTier || null;
+    claudeCache.ts   = Date.now();
+  } catch (e) {
+    claudeCache.error = e.message;
+  }
 }
 
 function mapRun(r) {
@@ -351,19 +451,19 @@ function refreshCi() {
     broadcastState();
   };
 
-  ghApi('repos/YOUR_GITHUB_ORG/YOUR_REPO/actions/runners', (data) => {
+  ghApi('repos/[your-github-username]/[Your Project]/actions/runners', (data) => {
     if (data && data.runners) {
       runners = data.runners.map(r => ({ id: r.id, name: r.name, status: r.status, busy: r.busy }));
     }
     done();
   });
 
-  ghApi('repos/YOUR_GITHUB_ORG/YOUR_REPO/actions/runs?status=in_progress&per_page=50', (data) => {
+  ghApi('repos/[your-github-username]/[Your Project]/actions/runs?status=in_progress&per_page=50', (data) => {
     if (data && data.workflow_runs) inProgress = data.workflow_runs.map(mapRun);
     done();
   });
 
-  ghApi('repos/YOUR_GITHUB_ORG/YOUR_REPO/actions/runs?status=queued&per_page=50', (data) => {
+  ghApi('repos/[your-github-username]/[Your Project]/actions/runs?status=queued&per_page=50', (data) => {
     if (data && data.workflow_runs) queued = data.workflow_runs.map(mapRun);
     done();
   });
@@ -506,16 +606,21 @@ function reorderCard(cardId, direction) {
   return true;
 }
 
-function removeProposal(headerLine) {
+function removeProposal(headerLine, action = 'removed') {
   let content;
   try { content = fs.readFileSync(PROPOSALS_PATH, 'utf8'); }
   catch (_) { return false; }
 
+  const today = new Date().toISOString().slice(0, 10);
+  const actionLabel = action === 'accept' ? 'accepted' : action === 'reject' ? 'rejected' : 'removed';
   const parts = content.split(/(?=^## |^### )/m);
   const idx = parts.findIndex(p => p.split('\n')[0] === headerLine);
   if (idx === -1) return false;
 
-  parts.splice(idx, 1);
+  // Mark resolved rather than delete outright — agents check for [RESOLVED] to avoid re-filing
+  const prefix = (headerLine.match(/^(#{2,3})/) || ['', '##'])[1];
+  const headerBody = headerLine.slice(prefix.length + 1);
+  parts[idx] = `${prefix} [RESOLVED ${today}] — ${actionLabel} by Keith\n${headerBody}\n\n`;
   let newContent = parts.join('');
   newContent = newContent.replace(/\n{3,}/g, '\n\n');
   fs.writeFileSync(PROPOSALS_PATH, newContent);
@@ -532,7 +637,7 @@ function broadcastState() {
   const board = readBoard();
   const agents = buildAgentStatus();
   const proposalsCount = parseProposals().length;
-  const msg = JSON.stringify({ ...board, agents, paused: isPaused(), proposalsCount, vps: vpsCache, ci: ciCache, ts: Date.now() });
+  const msg = JSON.stringify({ ...board, agents, paused: isPaused(), proposalsCount, speedMode: getSpeedMode(), throttleZone: getThrottleZone(), vps: vpsCache, ci: ciCache, ts: Date.now() });
   for (const client of wss.clients) {
     if (client.readyState === 1) client.send(msg);
   }
@@ -558,7 +663,7 @@ function triggerAgent(jobId, res) {
   const child = spawn('claude',
     ['--dangerously-skip-permissions', '--model', job.model || 'sonnet', '-p', job.message],
     { cwd: WORKSPACE, stdio: ['ignore', out, out],
-      env: { ...process.env, HOME: process.env.HOME || require('os').homedir() } });
+      env: { ...process.env, HOME: process.env.HOME || '/home/user' } });
 
   const timer = setTimeout(() => { child.kill('SIGTERM'); setTimeout(() => child.kill('SIGKILL'), 5000); },
     (job.timeoutSeconds || 300) * 1000);
@@ -582,7 +687,7 @@ const HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agent Kanban</title>
+<title>[Your Project]</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -710,7 +815,7 @@ header h1 { font-size: 14px; font-weight: 700; color: #a78bfa; }
 .col-changes-requested .col-header { border-top: 3px solid #ef4444; border-radius: 9px 9px 0 0; }
 .col-pending-human     .col-header { border-top: 3px solid #ec4899; border-radius: 9px 9px 0 0; }
 .col-approved          .col-header { border-top: 3px solid #4ade80; border-radius: 9px 9px 0 0; }
-.col-owners-queue      .col-header { border-top: 3px solid #a78bfa; border-radius: 9px 9px 0 0; }
+.col-keiths-queue      .col-header { border-top: 3px solid #a78bfa; border-radius: 9px 9px 0 0; }
 .col-shipped           .col-header { border-top: 3px solid #6b7280; border-radius: 9px 9px 0 0; }
 
 /* Agent panel */
@@ -734,6 +839,15 @@ header h1 { font-size: 14px; font-weight: 700; color: #a78bfa; }
 }
 .collapse-btn:hover { color: #94a3b8; }
 .agent-panel.collapsed { width: 36px; }
+.speed-btn {
+  background: #1e2235; border: 1px solid #3d4268; border-radius: 4px; cursor: pointer;
+  color: #94a3b8; font-size: 10px; font-weight: 700; letter-spacing: .06em;
+  padding: 2px 6px; line-height: 1.4; transition: all .15s; text-transform: uppercase;
+  white-space: nowrap;
+}
+.speed-btn:hover { border-color: #60a5fa; color: #60a5fa; }
+.speed-btn.fast   { border-color: #f59e0b; color: #f59e0b; }
+.agent-panel.collapsed .speed-btn { display: none; }
 .agent-panel.collapsed .agent-list,
 .agent-panel.collapsed .agent-panel-header span { display: none; }
 .agent-panel.collapsed .collapse-btn { transform: scaleX(-1); }
@@ -748,7 +862,9 @@ header h1 { font-size: 14px; font-weight: 700; color: #a78bfa; }
 }
 .agent-row:hover { border-color: #2d3148; background: #1a1d27; }
 .agent-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.agent-name { font-size: 11px; font-weight: 500; color: #cbd5e1; flex: 1; min-width: 0; }
+.agent-name-group { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.agent-name { font-size: 11px; font-weight: 500; color: #cbd5e1; }
+.agent-model { font-size: 9px; color: #3d4f66; font-variant-numeric: tabular-nums; }
 .agent-status {
   font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 4px;
   white-space: nowrap;
@@ -762,6 +878,10 @@ header h1 { font-size: 14px; font-weight: 700; color: #a78bfa; }
 .agent-countdown { font-size: 10px; color: #475569; font-variant-numeric: tabular-nums; width: 36px; text-align: right; flex-shrink: 0; }
 .agent-countdown.soon   { color: #fbbf24; }
 .agent-countdown.urgent { color: #ef4444; }
+.agent-interval { font-size: 9px; color: #2d3f55; cursor: pointer; margin-left: 3px; border-bottom: 1px dotted #334155; white-space: nowrap; flex-shrink: 0; }
+.agent-interval:hover { color: #64748b; border-color: #64748b; }
+.agent-interval-fixed { font-size: 9px; color: #1e2d3d; margin-left: 3px; white-space: nowrap; flex-shrink: 0; }
+.interval-input { background: #1e293b; border: 1px solid #475569; color: #e2e8f0; font-size: 10px; width: 42px; border-radius: 3px; padding: 1px 4px; text-align: center; font-variant-numeric: tabular-nums; }
 
 .agent-bar { height: 2px; background: #1e293b; border-radius: 1px; margin: 2px 9px 1px; overflow: hidden; }
 .agent-bar-fill { height: 100%; border-radius: 1px; transition: width .5s linear; }
@@ -914,11 +1034,11 @@ header h1 { font-size: 14px; font-weight: 700; color: #a78bfa; }
 <div id="auth-screen">
   <!-- Setup view: shown on first run before Google Authenticator is configured -->
   <div class="auth-box" id="setup-box" style="display:none">
-    <h2>Agent Kanban</h2>
-    <p>First-time setup — add Agent Kanban to Google Authenticator</p>
+    <h2>[Your Project]</h2>
+    <p>First-time setup — add [Your Project] to Google Authenticator</p>
     <div class="step"><strong>1.</strong> Open Google Authenticator on your phone</div>
     <div class="step"><strong>2.</strong> Tap + → Enter a setup key</div>
-    <div class="step"><strong>3.</strong> Account name: <strong>Agent Kanban</strong></div>
+    <div class="step"><strong>3.</strong> Account name: <strong>[Your Project] Kanban</strong></div>
     <div class="step"><strong>4.</strong> Key (copy exactly):</div>
     <div class="secret-box" id="totp-secret">loading…</div>
     <div class="step"><strong>5.</strong> Key type: <strong>Time based</strong> → Add</div>
@@ -929,7 +1049,7 @@ header h1 { font-size: 14px; font-weight: 700; color: #a78bfa; }
   </div>
   <!-- Login view: shown after setup is complete -->
   <div class="auth-box" id="login-box" style="display:none">
-    <h2>Agent Kanban</h2>
+    <h2>[Your Project]</h2>
     <p>Enter the 6-digit code from Google Authenticator</p>
     <input id="login-code-input" type="text" inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="one-time-code">
     <button id="login-submit">Unlock</button>
@@ -937,7 +1057,7 @@ header h1 { font-size: 14px; font-weight: 700; color: #a78bfa; }
   </div>
 </div>
 <header>
-  <h1>Agent Kanban</h1>
+  <h1>[Your Project]</h1>
   <span class="pause-badge" id="pause-badge">PAUSED</span>
   <div class="spacer"></div>
   <span id="updated"></span>
@@ -960,6 +1080,10 @@ header h1 { font-size: 14px; font-weight: 700; color: #a78bfa; }
   <div class="health-item" id="h-r2">Runner 2 –</div>
   <div class="health-sep"></div>
   <div class="health-item" id="h-updated" style="color:#3d4462"></div>
+  <div class="health-sep"></div>
+  <div class="health-item" id="h-claude-plan" style="color:#c084fc">Claude –</div>
+  <div class="health-sep"></div>
+  <div class="health-item" id="h-usage" style="color:#94a3b8">Usage –</div>
 </div>
 <div id="proposals-panel" class="hidden">
   <div class="proposals-inner">
@@ -984,6 +1108,7 @@ header h1 { font-size: 14px; font-weight: 700; color: #a78bfa; }
   <div class="agent-panel">
     <div class="agent-panel-header">
       <span>Agents</span>
+      <button class="speed-btn" id="speed-btn" title="Slow mode: Dev/Rev every 25m — click to toggle">Slow</button>
       <button class="collapse-btn" id="collapse-btn" title="Collapse">&#x276F;</button>
     </div>
     <div class="agent-list" id="agent-list"></div>
@@ -997,7 +1122,7 @@ const COLS = [
   { key: 'Changes Requested', cls: 'col-changes-requested' },
   { key: 'Pending Human',     cls: 'col-pending-human' },
   { key: 'Approved',          cls: 'col-approved' },
-  { key: "Owner's Queue",     cls: 'col-keiths-queue' },
+  { key: "Keith's Queue",     cls: 'col-keiths-queue' },
   { key: 'Shipped',           cls: 'col-shipped' },
 ];
 
@@ -1014,7 +1139,7 @@ function priorityBadge(p) {
 function renderCard(card) {
   const pr = card.pr && !card.pr.startsWith('(') ? card.pr : null;
   const prMatch = pr && pr.match(/#(\\d+)/);
-  const prLink = prMatch ? \`<a href="https://github.com/YOUR_GITHUB_ORG/YOUR_REPO/pull/\${prMatch[1]}" target="_blank">PR #\${prMatch[1]}</a>\` : '';
+  const prLink = prMatch ? \`<a href="https://github.com/[your-github-username]/[Your Project]/pull/\${prMatch[1]}" target="_blank">PR #\${prMatch[1]}</a>\` : '';
   return \`<div class="card \${card.type}" data-id="\${esc(card.id)}" data-title="\${esc(card.title)}">
     <div class="card-id">\${card.type==='bug'?'<span class="badge bug-type">BUG</span>':card.type==='audit'?'<span class="badge audit-type">AUDIT</span>':''}\${esc(card.id)}</div>
     <div class="card-title">\${esc(card.title)}</div>
@@ -1029,6 +1154,16 @@ function renderCard(card) {
 
 function renderBoard(data) {
   const board = document.getElementById('board');
+
+  // Preserve scroll positions per column and selected card state
+  const scrolls = {};
+  board.querySelectorAll('.column').forEach(function(col) {
+    const header = col.querySelector('.col-header');
+    const body = col.querySelector('.col-body');
+    if (header && body) scrolls[header.dataset.col] = body.scrollTop;
+  });
+  const hadSelection = selectedCardId;
+
   board.innerHTML = '';
   for (const { key, cls } of COLS) {
     const cards = data.columns[key] || [];
@@ -1039,6 +1174,14 @@ function renderBoard(data) {
       <div class="col-body">\${cards.length ? cards.map(renderCard).join('') : '<div class="empty">empty</div>'}</div>\`;
     board.appendChild(col);
   }
+
+  // Restore scroll positions
+  board.querySelectorAll('.column').forEach(function(col) {
+    const header = col.querySelector('.col-header');
+    const body = col.querySelector('.col-body');
+    if (header && body && scrolls[header.dataset.col]) body.scrollTop = scrolls[header.dataset.col];
+  });
+
   if (data.ts) document.getElementById('updated').textContent = 'Updated ' + new Date(data.ts).toLocaleTimeString();
 
   // Reorder buttons (▲ ▼ ⤒)
@@ -1081,6 +1224,17 @@ function renderBoard(data) {
       }).catch(() => null);
     });
   });
+
+  // Restore selected card visual state after re-render
+  if (hadSelection) {
+    const stillExists = board.querySelector(\`.card[data-id="\${hadSelection}"]\`);
+    if (stillExists) {
+      stillExists.classList.add('selected');
+      board.querySelectorAll('.col-header').forEach(function(h) { h.classList.add('drop-target'); });
+    } else {
+      selectedCardId = null;
+    }
+  }
 }
 
 // Card selection
@@ -1122,30 +1276,68 @@ function fmtSecs(s) {
   return s + 's';
 }
 
-function renderAgents() {
-  const elapsed = (Date.now() - localTs) / 1000;
-  const list = document.getElementById('agent-list');
+let editingAgentId = null;
+
+function buildAgentList(list, elapsed) {
   list.innerHTML = '';
   for (const a of agentData) {
     const live = Math.max(0, a.secsUntil - elapsed);
     const pct  = Math.min(1, Math.max(0, 1 - live / a.maxSecs));
     const cntCls = live < 30 ? 'urgent' : live < 120 ? 'soon' : '';
+    const isEditing = editingAgentId === a.id;
+
+    let intervalEl = '';
+    if (isEditing) {
+      intervalEl = \`<input class="interval-input" id="interval-edit-\${esc(a.id)}" value="\${esc(a.intervalRaw||'')}" data-id="\${esc(a.id)}" title="e.g. 10m or 2h">\`;
+    } else if (a.intervalLabel && a.intervalEditable) {
+      intervalEl = \`<span class="agent-interval" data-id="\${esc(a.id)}" title="click to edit">/\${esc(a.intervalLabel)}</span>\`;
+    } else if (a.intervalLabel) {
+      intervalEl = \`<span class="agent-interval-fixed" title="\${esc(a.intervalLabel)}">/\${esc(a.intervalLabel)}</span>\`;
+    }
+
     const row = document.createElement('div');
     row.className = 'agent-row';
     row.dataset.id = a.id;
+    row.dataset.status = a.status;
+    row.dataset.editing = String(isEditing);
     row.innerHTML = \`
       <div class="agent-dot" style="background:\${a.color}"></div>
-      <div class="agent-name">\${esc(a.name)}</div>
+      <div class="agent-name-group">
+        <div class="agent-name">\${esc(a.name)}</div>
+        <div class="agent-model">\${esc(a.model||'sonnet')}</div>
+      </div>
       <span class="agent-status status-\${a.status}">\${a.status}</span>
       <span class="agent-countdown \${cntCls}">\${a.status==='running'?'…':fmtSecs(live)}</span>
+      \${intervalEl}
       <button class="run-btn" data-id="\${a.id}" \${a.status==='running'?'disabled':''}>▶</button>\`;
+    if (a.hint) row.title = a.hint;
     list.appendChild(row);
 
-    if (a.hint) {
-      const hint = document.createElement('div');
-      hint.className = 'agent-hint';
-      hint.textContent = '↳ ' + a.hint;
-      list.appendChild(hint);
+    if (isEditing) {
+      const input = row.querySelector('.interval-input');
+      if (input) {
+        requestAnimationFrame(() => { input.focus(); input.select(); });
+        const save = () => {
+          if (!editingAgentId) return;
+          const val = input.value.trim();
+          editingAgentId = null;
+          if (val && val !== a.intervalRaw) {
+            authFetch('/api/schedule/' + encodeURIComponent(a.id), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ interval: val })
+            }).then(r => r.json()).then(d => { if (!d.ok) alert('Invalid interval: ' + (d.error||'unknown')); })
+              .catch(() => alert('Failed to update schedule'));
+          }
+          renderAgents();
+        };
+        input.addEventListener('keydown', e => {
+          if (e.key === 'Enter') { e.preventDefault(); save(); }
+          if (e.key === 'Escape') { editingAgentId = null; renderAgents(); }
+        });
+        // Delay blur listener so focus settling doesn't immediately fire it
+        setTimeout(() => { if (editingAgentId) input.addEventListener('blur', save); }, 200);
+      }
     }
 
     const bar = document.createElement('div');
@@ -1160,6 +1352,45 @@ function renderAgents() {
       btn.disabled = true;
       authFetch('/api/trigger/' + btn.dataset.id, { method: 'POST' }).catch(() => {});
     });
+  });
+
+  // Attach interval click handlers
+  list.querySelectorAll('.agent-interval').forEach(el => {
+    el.addEventListener('click', () => { editingAgentId = el.dataset.id; renderAgents(); });
+  });
+}
+
+function renderAgents() {
+  // Don't clobber the DOM while an interval input is focused
+  if (editingAgentId && document.activeElement && document.activeElement.classList.contains('interval-input')) return;
+  const elapsed = (Date.now() - localTs) / 1000;
+  const list = document.getElementById('agent-list');
+
+  // Check whether structure needs a full rebuild
+  const rows = list.querySelectorAll('.agent-row');
+  const structureChanged =
+    rows.length !== agentData.length ||
+    agentData.some((a, i) =>
+      rows[i].dataset.id      !== a.id      ||
+      rows[i].dataset.status  !== a.status  ||
+      rows[i].dataset.editing !== String(editingAgentId === a.id)
+    );
+
+  if (structureChanged) {
+    buildAgentList(list, elapsed);
+    return;
+  }
+
+  // Fast path: only update countdowns and bar widths — leaves DOM nodes intact so tooltips survive
+  const bars = list.querySelectorAll('.agent-bar');
+  agentData.forEach((a, i) => {
+    const live   = Math.max(0, a.secsUntil - elapsed);
+    const pct    = Math.min(1, Math.max(0, 1 - live / a.maxSecs));
+    const cntCls = live < 30 ? 'urgent' : live < 120 ? 'soon' : '';
+    const cd = rows[i].querySelector('.agent-countdown');
+    if (cd) { cd.textContent = a.status === 'running' ? '…' : fmtSecs(live); cd.className = \`agent-countdown \${cntCls}\`; }
+    const fill = bars[i] && bars[i].querySelector('.agent-bar-fill');
+    if (fill) fill.style.width = Math.round(pct * 100) + '%';
   });
 }
 
@@ -1193,6 +1424,49 @@ function connectWs() {
     document.getElementById('pause-badge').classList.toggle('visible', paused);
     document.getElementById('btn-pause').disabled = paused;
     document.getElementById('btn-unpause').disabled = !paused;
+    if (data.speedMode !== undefined) {
+      const btn = document.getElementById('speed-btn');
+      const zone = data.throttleZone;
+      const manual = zone && zone.manualSprint ? ' ★' : '';
+      // Show weekly% and session% if available
+      let pctLabel = '';
+      if (zone) {
+        pctLabel = ' ' + zone.usagePct + '%';
+        if (zone.sessionPct !== null && zone.sessionPct !== undefined) {
+          pctLabel += ' / ' + zone.sessionPct + '%S';
+        }
+      }
+      const src = zone && zone.dataSource === 'estimated' ? ' (est.)' : '';
+      const sessionInfo = zone && zone.sessionPct !== null && zone.sessionPct !== undefined
+        ? ' | Session: ' + zone.sessionPct + '%' + (zone.sessionResetsIn ? ' (resets in ' + zone.sessionResetsIn + 'm)' : '')
+        : '';
+      const tooltip = zone
+        ? 'Weekly: ' + zone.usagePct + '% all-models, ' + zone.sonnetPct + '% Sonnet' + src + sessionInfo + ' | ' + zone.hoursUntilReset.toFixed(1) + 'h until reset'
+        : '';
+      // Update top-bar usage widget
+      const usageEl = document.getElementById('h-usage');
+      if (usageEl) {
+        if (zone) {
+          const hrs  = zone.hoursUntilReset.toFixed(1);
+          const days = (zone.hoursUntilReset / 24).toFixed(1);
+          const est  = zone.dataSource === 'estimated' ? ' <span style="color:#64748b">(est.)</span>' : '';
+          usageEl.innerHTML =
+            \`<strong style="color:#c084fc">\${zone.usagePct}%</strong>\` +
+            \` / <strong style="color:#818cf8">\${zone.sonnetPct}%S</strong>\${est}\` +
+            \` · <strong style="color:#94a3b8">\${hrs}h / \${days}d</strong>\`;
+        } else {
+          usageEl.textContent = 'Usage –';
+        }
+      }
+      btn.classList.remove('fast', 'conservation', 'minimal');
+      if (data.speedMode === 'fast') {
+        btn.textContent = 'Sprint' + manual; btn.classList.add('fast');
+        btn.title = 'Sprint: Dev/Rev every 5m' + (manual ? ' (manual override)' : '') + ' — ' + tooltip + ' — click to slow';
+      } else {
+        btn.textContent = 'Slow';
+        btn.title = 'Slow: Dev every 25m, Rev every 30m — ' + tooltip + ' — click to sprint';
+      }
+    }
     renderAgents();
     if (typeof data.proposalsCount === 'number') {
       document.getElementById('proposals-count').textContent = data.proposalsCount;
@@ -1211,12 +1485,33 @@ function showError(el, msg) {
   el.style.display = msg ? 'block' : 'none';
 }
 
+function fmtPlan(plan) {
+  if (!plan) return '–';
+  const map = { max: 'Max', pro: 'Pro', free: 'Free' };
+  return map[plan.toLowerCase()] || plan;
+}
+
+function renderClaudeInfo(info) {
+  const planEl = document.getElementById('h-claude-plan');
+  if (info && info.plan) {
+    planEl.innerHTML = \`Claude <strong style="color:#c084fc">\${fmtPlan(info.plan)}</strong>\`;
+  }
+}
+
+function loadClaudeInfo() {
+  authFetch('/api/claude-info').then(r => r.json()).then(info => {
+    renderClaudeInfo(info);
+  }).catch(() => {});
+}
+
 function unlockApp(token) {
   authToken = token;
   sessionStorage.setItem('kanban_token', token);
   document.getElementById('auth-screen').classList.add('hidden');
   connectWs();
   refreshProposalsCount();
+  loadClaudeInfo();
+  setInterval(loadClaudeInfo, 5 * 60 * 1000);
 }
 
 // Setup flow (first time)
@@ -1513,6 +1808,16 @@ ciCollapseBtn.addEventListener('click', () => {
   localStorage.setItem('ci_collapsed', c ? '1' : '0');
 });
 
+// Speed mode toggle
+document.getElementById('speed-btn').addEventListener('click', () => {
+  const btn = document.getElementById('speed-btn');
+  const current = btn.classList.contains('fast') ? 'fast' : 'slow';
+  const next = current === 'fast' ? 'slow' : 'fast';
+  authFetch('/api/speed-mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: next }) })
+    .then(r => r.json())
+    .catch(() => {});
+});
+
 // Collapse sidebar
 const agentPanel = document.querySelector('.agent-panel');
 const collapseBtn = document.getElementById('collapse-btn');
@@ -1671,20 +1976,53 @@ const server = http.createServer((req, res) => {
         }
         if (action === 'ask') {
           const typeLabel = type === 'system' ? 'System improvement' : 'Proposal';
-          const msg = `❓ **Question about:** ${title}\n${typeLabel} · ${date} · ${role}\n_What would you like to know?_`;
-          spawn('node', [path.join(WORKSPACE, 'scripts/discord-post.js'), process.env.PROPOSALS_CHANNEL_ID || 'YOUR_PROPOSALS_CHANNEL_ID', msg],
+          const msg = `❓ **Question about:** ${title}\n${typeLabel} · ${date} · ${role}\n_Keith, what do you want to know?_`;
+          spawn('node', [path.join(WORKSPACE, 'scripts/discord-post.js'), 'YOUR_CHANNEL_ID', msg],
             { cwd: WORKSPACE, stdio: 'ignore',
-              env: { ...process.env, HOME: process.env.HOME || require('os').homedir() } });
+              env: { ...process.env, HOME: process.env.HOME || '/home/user' } });
           res.writeHead(200, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ ok: true }));
         }
-        const ok = removeProposal(headerLine);
+        // Grab full proposal text before removing it
+        const allProposals = parseProposals();
+        const matched = allProposals.find(p => p.headerLine === headerLine);
+        const proposalRaw = matched ? matched.raw : '';
+
+        const ok = removeProposal(headerLine, action);
         if (ok && action === 'accept') {
           const typeLabel = type === 'system' ? 'System improvement' : 'Proposal';
           const msg = `✓ **Accepted:** ${title}\n${typeLabel} · ${date} · ${role}`;
-          spawn('node', [path.join(WORKSPACE, 'scripts/discord-post.js'), process.env.PROPOSALS_CHANNEL_ID || 'YOUR_PROPOSALS_CHANNEL_ID', msg],
+          spawn('node', [path.join(WORKSPACE, 'scripts/discord-post.js'), 'YOUR_CHANNEL_ID', msg],
             { cwd: WORKSPACE, stdio: 'ignore',
-              env: { ...process.env, HOME: process.env.HOME || require('os').homedir() } });
+              env: { ...process.env, HOME: process.env.HOME || '/home/user' } });
+
+          // Spawn Claude to implement the accepted proposal automatically
+          const implementPrompt = `A proposal has just been accepted in the [Your Project] kanban board. Implement it now without waiting for further instruction.
+
+Title: ${title}
+Type: ${typeLabel}
+Filed by: ${role} on ${date}
+
+Full proposal text:
+${proposalRaw}
+
+Implementation rules:
+- For a NEW GOAL or ROADMAP ADDITION: add it to /root/[your-project]/research/implementation-roadmap-v2.md in the appropriate position (after the last current goal). Include scope, dependencies, and a note that PRD is pending if no PRD exists yet.
+- For a SYSTEM IMPROVEMENT (prompt change, schedule tuning, workflow fix, code change): implement the specific change described in the proposal text. Make the actual file edits.
+- For anything requiring a DESIGN DECISION from Keith before you can act: post a question to Discord channel YOUR_CHANNEL_ID explaining what you need from him before you can proceed.
+- The proposal has already been removed from proposals.md — do not re-add it.
+- Post a brief completion summary to Discord channel YOUR_CHANNEL_ID when done.`;
+
+          fs.mkdirSync(LOG_DIR, { recursive: true });
+          const logPath = path.join(LOG_DIR, `${new Date().toISOString().slice(0, 10)}-proposal-accept.log`);
+          const out = fs.openSync(logPath, 'a');
+          fs.writeSync(out, `\n=== ${new Date().toISOString()} — Proposal accepted: ${title} ===\n`);
+          const impl = spawn('claude',
+            ['--dangerously-skip-permissions', '--model', 'sonnet', '-p', implementPrompt],
+            { cwd: '/root/[your-project]', stdio: ['ignore', out, out],
+              env: { ...process.env, HOME: process.env.HOME || '/home/user' } });
+          impl.on('close', () => { try { fs.closeSync(out); } catch (_) {} });
+          impl.on('error', () => { try { fs.closeSync(out); } catch (_) {} });
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok }));
@@ -1706,8 +2044,8 @@ const server = http.createServer((req, res) => {
         const toCancel = ciCache.queue.filter(r => r.id !== runId && r.status === 'queued');
         for (const r of toCancel) {
           if (!ciCache.bumpCancelled.find(x => x.id === r.id)) ciCache.bumpCancelled.push(r);
-          exec(`${GH} run cancel ${r.id} --repo YOUR_GITHUB_ORG/YOUR_REPO`,
-            { env: { ...process.env, HOME: process.env.HOME || require('os').homedir() } }, () => {});
+          exec(`${GH} run cancel ${r.id} --repo [your-github-username]/[Your Project]`,
+            { env: { ...process.env, HOME: process.env.HOME || '/home/user' } }, () => {});
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, cancelled: toCancel.length }));
@@ -1727,8 +2065,8 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       try {
         const { runId } = JSON.parse(body);
-        exec(`${GH} run cancel ${runId} --repo YOUR_GITHUB_ORG/YOUR_REPO`,
-          { env: { ...process.env, HOME: process.env.HOME || require('os').homedir() } }, () => {});
+        exec(`${GH} run cancel ${runId} --repo [your-github-username]/[Your Project]`,
+          { env: { ...process.env, HOME: process.env.HOME || '/home/user' } }, () => {});
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
         setTimeout(refreshCi, 3000);
@@ -1744,14 +2082,95 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       try {
         const { runId } = JSON.parse(body);
-        exec(`${GH} run rerun ${runId} --repo YOUR_GITHUB_ORG/YOUR_REPO`,
-          { env: { ...process.env, HOME: process.env.HOME || require('os').homedir() } }, () => {});
+        exec(`${GH} run rerun ${runId} --repo [your-github-username]/[Your Project]`,
+          { env: { ...process.env, HOME: process.env.HOME || '/home/user' } }, () => {});
         ciCache.bumpCancelled = ciCache.bumpCancelled.filter(r => r.id !== runId);
         broadcastState();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
         setTimeout(refreshCi, 5000);
       } catch (_) { res.writeHead(400); res.end('bad request'); }
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && req.url === '/api/claude-info') {
+    refreshClaudeInfo();
+    const { plan, tier, ts, error } = claudeCache;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ plan, tier, ts, error }));
+  }
+
+  if (req.method === 'POST' && req.url.startsWith('/api/schedule/')) {
+    const agentId = decodeURIComponent(req.url.slice('/api/schedule/'.length));
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', () => {
+      try {
+        const { interval } = JSON.parse(body);
+        const hoursMatch = /^(\d+)h$/i.exec(String(interval).trim());
+        const minsMatch  = /^(\d+)m?$/i.exec(String(interval).trim());
+        let newCron, newEveryNMinutes, newEveryNHours;
+
+        if (hoursMatch) {
+          const h = parseInt(hoursMatch[1]);
+          if (h < 1 || h > 24) throw new Error('hours must be 1–24');
+          newEveryNHours = h;
+          newCron = `0 */${h} * * *`;
+        } else if (minsMatch) {
+          const m = parseInt(minsMatch[1]);
+          if (m < 1 || m > 59) throw new Error('minutes must be 1–59');
+          newEveryNMinutes = m;
+          const offsets = [];
+          for (let i = 0; i < 60; i += m) offsets.push(i);
+          newCron = offsets.join(',') + ' * * * *';
+        } else {
+          throw new Error('use e.g. "10m" or "2h"');
+        }
+
+        const def = AGENT_DEFS.find(d => d.id === agentId);
+        if (!def)       throw new Error('agent not found');
+        if (def.daily)  throw new Error('daily agents are not editable');
+
+        delete def.schedule;
+        delete def.everyNMinutes;
+        delete def.everyNHours;
+        if (newEveryNMinutes) def.everyNMinutes = newEveryNMinutes;
+        else                  def.everyNHours   = newEveryNHours;
+
+        const jobs = JSON.parse(fs.readFileSync(JOBS_FILE, 'utf8'));
+        const job  = jobs.find(j => j.id === agentId);
+        if (job) {
+          job.schedule = newCron;
+          fs.writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 2));
+        }
+
+        broadcastState();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/api/speed-mode') {
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', () => {
+      try {
+        const { mode } = JSON.parse(body);
+        if (mode !== 'fast' && mode !== 'slow') throw new Error('mode must be fast or slow');
+        applySpeedMode(mode);
+        broadcastState();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, mode }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
     });
     return;
   }
@@ -1769,7 +2188,7 @@ wss.on('connection', (ws, req) => {
     ws.close(4001, 'Unauthorized');
     return;
   }
-  ws.send(JSON.stringify({ ...readBoard(), agents: buildAgentStatus(), paused: isPaused(), vps: vpsCache, ci: ciCache, ts: Date.now() }));
+  ws.send(JSON.stringify({ ...readBoard(), agents: buildAgentStatus(), paused: isPaused(), speedMode: getSpeedMode(), throttleZone: getThrottleZone(), vps: vpsCache, ci: ciCache, ts: Date.now() }));
 });
 
 // Push board updates when backlog or proposals change
@@ -1789,12 +2208,14 @@ setInterval(broadcastState, 5000);
 // Refresh VPS health every 10s; CI queue every 30s
 refreshVps();
 refreshCi();
+refreshClaudeInfo();
 setInterval(refreshVps, 10_000);
 setInterval(refreshCi, 30_000);
+setInterval(refreshClaudeInfo, 5 * 60_000);
 
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 
-server.listen(PORT, '0.0.0.0', () => console.log(`Agent Kanban → http://localhost:${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`[Your Project] Kanban → http://localhost:${PORT}`));
 process.on('SIGINT', () => { fs.unwatchFile(BACKLOG_PATH); process.exit(0); });

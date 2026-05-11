@@ -1,15 +1,10 @@
 {
-  "name": "kanban-board",
+  "name": "claude-bot-workspace",
   "version": "1.0.0",
-  "description": "Kanban board server for the autonomous dev agents system",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "private": true,
+  "description": "Claude Code Discord bot workspace",
   "dependencies": {
-    "ws": "^8.18.0"
-  },
-  "engines": {
-    "node": ">=18"
+    "better-sqlite3": "^12.9.0",
+    "discord.js": "^14.0.0"
   }
 }
